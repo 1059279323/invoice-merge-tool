@@ -1,4 +1,4 @@
-import streamlit  streamlit as st
+import streamlit as st
 import pandas as pd
 import PyPDF2
 import io
@@ -12,30 +12,30 @@ st.subheader("上传多个PDF发票文件，一键合并")
 
 # 上传PDF文件
 uploaded_files = st.file_uploader(
-    "选择PDF发票文件",,,,
-    type=    type=["pdf"],,
-    accept_multiple_files=    accept_multiple_files=True
+    "选择PDF发票文件",
+    type=["pdf"],
+    accept_multiple_files=True
 )
 
-def merge_pdfs(pdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_filespdf_files)::::::::::::::::
+def merge_pdfs(pdf_files):
     """合并多个PDF文件"""
-    merger = PyPDF2.            merger = PyPDF2.        merger = PyPDF2.     = PyPDF2.    merger = PyPDF2. = PyPDF2. = PyPDF2. = PyPDF2.PdfMerger()
-    for pdf  pdf  pdf  pdf in pdf_files: pdf_files: pdf_files: pdf_files:
-        merger.                merger.        merger..append(pdfpdfpdfpdf)
+    merger = PyPDF2.PdfMerger()
+    for pdf in pdf_files:
+        merger.append(pdf)
     
     # 生成合并后的PDF
-    output = io.            output = io.        output = io.     = io.    output = io. = io. = io. = io.BytesIO()
-    merger.        merger.    merger..write(outputoutputoutputoutput)
-    output.                output.            output.        .        output.    .    .    .    output........seek(0)
-    merger.            merger.        merger.    .    merger....close()
-    return output output output output
+    output = io.BytesIO()
+    merger.write(output)
+    output.seek(0)
+    merger.close()
+    return output
 
 # 处理逻辑
-if uploaded_files: uploaded_files: uploaded_files: uploaded_files:
-    try::::
+if uploaded_files:
+    try:
         # 预览上传文件
-        st.        st.success(f"✅ 成功上传 {len(uploaded_filesuploaded_files)} 个PDF文件")
-        file_names =         file_names = [f.f.name for f  f in uploaded_files uploaded_files]
+        st.success(f"✅ 成功上传 {len(uploaded_files)} 个PDF文件")
+        file_names = [f.name for f in uploaded_files]
         st.write("上传文件列表：", file_names)
 
         # 合并PDF
