@@ -1,3 +1,6 @@
-streamlit
-pandas
-PyPDF2
+pdfplumber 
+pikepdf 
+reportlab 
+fastapi 
+uvicorn 
+python-multipart 
