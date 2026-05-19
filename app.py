@@ -3,25 +3,22 @@ import PyPDF2
 import io
 import re
 from datetime import datetime
-from itertools import groupby
 
 # 页面配置
 st.set_page_config(page_title="发票合并助手", page_icon="📄", layout="wide")
 st.title("📄 发票合并助手")
-st.subheader("智能排序：按日期分组 → 组内行程单+发票交替配对")
+st.subheader("稳定排序：按日期升序 → 同日期行程单在前 → 按文件名")
 
-# 侧边栏：使用说明
+# 侧边栏说明
 with st.sidebar:
-    st.header("⚙️ 排序规则")
-    st.info("💡 **核心逻辑**：\n"
-            "1️⃣ 按日期升序分组（未识别日期排最后）\n"
-            "2️⃣ 同日期内：行程单与发票按文件名排序后交替配对\n"
-            "   `行程单[0] → 发票[0] → 行程单[1] → 发票[1] ...`\n"
-            "3️⃣ **命名建议**：同一次行程的行程单和发票保持相同标识，如：\n"
-            "   `20240425_上午_行程单_机票.pdf`\n"
-            "   `20240425_上午_发票_机票.pdf`")
+    st.header("⚙️ 排序逻辑说明")
+    st.info("💡 **采用财务标准稳定排序法**：\n"
+            "1️⃣ 第一优先级：日期升序（25号一定在27号前）\n"
+            "2️⃣ 第二优先级：文件类型（行程单 → 发票 → 其他）\n"
+            "3️⃣ 第三优先级：文件名自然排序\n"
+            "✅ 同一天内：所有行程单集中排在前，所有发票集中在后，彻底避免错位。")
 
-# 上传PDF文件
+# 上传区域
 uploaded_files = st.file_uploader(
     "📁 上传PDF文件（支持多选）",
     type=["pdf"],
@@ -30,151 +27,103 @@ uploaded_files = st.file_uploader(
 )
 
 def extract_date_from_filename(filename):
-    """从文件名提取日期，兼容多种格式与中文"""
-    # 统一替换中文日期标识，便于正则匹配
-    clean_name = re.sub(r'[年月日]', '-', filename)
-    
-    # 1. 优先匹配 YYYY-MM-DD / YYYY.MM.DD / YYYYMMDD
-    m = re.search(r'(\d{4})[-.](\d{1,2})[-.](\d{1,2})', clean_name) or \
-        re.search(r'(\d{4})(\d{2})(\d{2})', clean_name)
-    if m:
-        try: return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
-        except: pass
-        
-    # 2. 匹配 DD-MM-YYYY / MM-DD-YYYY / DDMYYYY 等
-    m = re.search(r'(\d{1,2})[-.](\d{1,2})[-.](\d{4})', clean_name) or \
-        re.search(r'(\d{2})(\d{2})(\d{4})', clean_name)
-    if m:
-        p1, p2, p3 = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        # 智能推断：>12 的必然是日或月
-        if p1 > 12: d, mon, y = p1, p2, p3
-        elif p2 > 12: d, mon, y = p2, p1, p3
-        else: d, mon, y = p2, p1, p3  # 默认按 MMDDYYYY 处理
-        try: return datetime(y, mon, d).date()
-        except: pass
-        
+    """高精度日期提取，避免过度推断导致错乱"""
+    # 匹配 2024-04-25 / 20240425 / 2024年04月25日 / 2024.04.25
+    match = re.search(r'(\d{4})[-年.月]?(\d{2})[-月.日]?(\d{2})', filename)
+    if match:
+        try:
+            return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3))).date()
+        except ValueError:
+            pass
     return None
 
 def classify_file(filename):
-    """分类文件：行程单 / 发票 / 其他"""
-    filename_lower = filename.lower()
-    if any(kw in filename_lower for kw in ['行程单', 'itinerary', 'flight', 'train', 'ticket']):
+    """文件类型分类"""
+    name_lower = filename.lower()
+    if any(k in name_lower for k in ['行程单', 'itinerary', 'flight', 'train', 'ticket']):
         return '行程单'
-    elif any(kw in filename_lower for kw in ['发票', 'invoice', 'receipt', 'bill']):
+    if any(k in name_lower for k in ['发票', 'invoice', 'receipt', 'bill']):
         return '发票'
-    else:
-        return '其他'
+    return '其他'
 
 def smart_sort_files(files):
-    """智能排序：按日期分组，每组内行程单+发票交替配对排列"""
-    file_info = []
-    unknown_dates = []
-    
+    """核心排序函数：单一稳定键排序"""
+    info_list = []
     for f in files:
-        filename = f.name
-        file_date = extract_date_from_filename(filename)
-        file_type = classify_file(filename)
+        date_obj = extract_date_from_filename(f.name)
+        ftype = classify_file(f.name)
+        # 类型权重：行程单(0) < 发票(1) < 其他(2)
+        weight = {'行程单': 0, '发票': 1, '其他': 2}.get(ftype, 2)
+        # 无日期文件统一排在最后
+        sort_date = date_obj if date_obj else datetime(9999, 12, 31).date()
         
-        if file_date is None:
-            unknown_dates.append({'file': f, 'name': filename, 'type': file_type, 'date': None})
-        else:
-            file_info.append({'file': f, 'name': filename, 'type': file_type, 'date': file_date})
+        info_list.append({
+            'file': f,
+            'name': f.name,
+            'date': sort_date,
+            'type': ftype,
+            'weight': weight,
+            'has_date': date_obj is not None
+        })
 
-    # 按日期排序（有效日期在前，按时间升序）
-    file_info.sort(key=lambda x: x['date'])
-    
-    result = []
-    # 按日期分组处理
-    for date, group in groupby(file_info, key=lambda x: x['date']):
-        group_list = list(group)
-        
-        itineraries = sorted([i for i in group_list if i['type'] == '行程单'], key=lambda x: x['name'])
-        invoices = sorted([i for i in group_list if i['type'] == '发票'], key=lambda x: x['name'])
-        others = sorted([i for i in group_list if i['type'] == '其他'], key=lambda x: x['name'])
-        
-        # 🔄 核心：交替合并行程单和发票
-        max_len = max(len(itineraries), len(invoices))
-        for i in range(max_len):
-            if i < len(itineraries): result.append(itineraries[i])
-            if i < len(invoices): result.append(invoices[i])
-        result.extend(others)
-        
-    # 未识别日期的文件固定排在最后
-    unknown_dates.sort(key=lambda x: x['name'])
-    result.extend(unknown_dates)
-    
-    return [item['file'] for item in result]
+    # 【核心】一行完成稳定排序：(日期, 类型权重, 文件名)
+    sorted_list = sorted(info_list, key=lambda x: (x['date'], x['weight'], x['name']))
+    return sorted_list
 
 def merge_pdfs(pdf_files):
-    """合并PDF文件"""
+    """合并PDF"""
     if not pdf_files: return None
     merger = PyPDF2.PdfMerger()
     for pdf in pdf_files:
         merger.append(pdf)
-    output = io.BytesIO()
-    merger.write(output)
-    output.seek(0)
+    out = io.BytesIO()
+    merger.write(out)
+    out.seek(0)
     merger.close()
-    return output
+    return out
 
 # 主逻辑
 if uploaded_files:
     st.success(f"✅ 已上传 {len(uploaded_files)} 个文件")
-    
+
     if st.button("🔗 开始智能合并", type="primary", use_container_width=True):
         try:
-            with st.spinner("🔄 正在分析文件并排序..."):
-                sorted_files = smart_sort_files(uploaded_files)
+            with st.spinner("🔄 正在按规则排序..."):
+                sorted_info = smart_sort_files(uploaded_files)
 
-            # 显示排序结果（按天分组展示）
-            with st.expander("✅ 合并顺序预览", expanded=True):
-                preview_info = []
-                for f in sorted_files:
-                    preview_info.append({
-                        'file': f,
-                        'date': extract_date_from_filename(f.name),
-                        'type': classify_file(f.name)
-                    })
-                
-                # 按日期分组渲染
-                has_valid = [p for p in preview_info if p['date'] is not None]
-                has_unknown = [p for p in preview_info if p['date'] is None]
-                
-                for date, group in groupby(has_valid, key=lambda x: x['date']):
-                    st.markdown(f"**📅 {date}**")
-                    for item in group:
-                        icon = "🎫" if item['type'] == "行程单" else "🧾" if item['type'] == "发票" else "📄"
-                        st.text(f"   {icon} [{item['type']}] {item['file'].name}")
-                    st.divider()
-                    
-                if has_unknown:
-                    st.markdown("**📅 未知日期（排最后）**")
-                    for item in has_unknown:
-                        icon = "🎫" if item['type'] == "行程单" else "🧾" if item['type'] == "发票" else "📄"
-                        st.text(f"   {icon} [{item['type']}] {item['file'].name}")
-                    st.warning("⚠️ 以上文件名未提取到有效日期，建议改为 `YYYYMMDD_xxx.pdf` 格式")
+            # 预览排序结果（按天分组显示，直观验证）
+            with st.expander("✅ 最终合并顺序预览", expanded=True):
+                current_date = None
+                for item in sorted_info:
+                    if item['date'] != current_date:
+                        current_date = item['date']
+                        date_str = str(current_date) if item['has_date'] else "📅 未知日期（固定排最后）"
+                        st.markdown(f"**{date_str}**")
+                    icon = "🎫" if item['type']=="行程单" else "🧾" if item['type']=="发票" else "📄"
+                    st.text(f"   {icon} [{item['type']}] {item['name']}")
+                st.divider()
 
             # 执行合并
             with st.spinner("📦 正在合并PDF..."):
+                sorted_files = [item['file'] for item in sorted_info]
                 merged_pdf = merge_pdfs(sorted_files)
 
             if merged_pdf:
                 st.download_button(
-                    label="📥 下载合并后的发票包",
+                    label="📥 下载合并后的PDF",
                     data=merged_pdf,
                     file_name=f"发票合并包_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
                     mime="application/pdf",
                     use_container_width=True
                 )
                 st.balloons()
-                st.success("✨ 合并成功！按日期升序分组，组内行程单+发票交替排列")
-
+                st.success("✨ 合并完成！顺序稳定：日期升序 → 行程单优先 → 文件名排序")
+                
         except Exception as e:
-            st.error(f"❌ 处理失败：{str(e)}")
+            st.error(f"❌ 处理失败：{e}")
             st.exception(e)
 else:
-    st.info("👆 请上传PDF格式的文件开始使用")
+    st.info("👆 请上传PDF文件开始使用")
 
-# 页脚
 st.markdown("---")
-st.caption("✅ 智能日期解析 | 按天分组 | 组内行程单在前+发票在后 | PyPDF2后端")
+st.caption("✅ 采用单一稳定排序键 | 彻底避免逻辑冲突导致错乱 | PyPDF2后端")
