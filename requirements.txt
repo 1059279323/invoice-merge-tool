@@ -1,6 +1,4 @@
-pdfplumber 
-pikepdf 
-reportlab 
-fastapi 
-uvicorn 
-python-multipart 
+  streamlit>=1.28
+  pdfplumber>=0.10
+  pikepdf>=8.0
+  reportlab>=4.0
