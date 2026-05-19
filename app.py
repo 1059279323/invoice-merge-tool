@@ -1,5 +1,5 @@
-"""
-发票合并助手 - FastAPI Web 后端
+""""""
+发票合并助手 - FastAPI Web 后端发票合并助手 - FastAPI Web 后端
 """
 
 import os
@@ -29,14 +29,6 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("invoice_merger")
-
-from core import (
-    USE_PIKEPDF,
-    extract_all_pdfs,
-    match_trips_invoices,
-    get_statistics,
-    merge_pdfs_with_placeholders,
-)
 
 app = FastAPI(title="发票合并助手 API", version="1.0")
 
