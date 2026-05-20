@@ -1,4 +1,4 @@
-"""
+""""""
 发票合并助手 — Streamlit 应用
 行程单 × 发票 PDF 智能配对，按时间顺序合并
 """
@@ -60,9 +60,19 @@ def _inject_css():
     st.markdown(
         """
     <style>
-    /* 全局 */
+    /* 全局 — 深色基底 */
     .stApp {
-        background: linear-gradient(135deg, #f5f7fa 0%, #e4e8f0 100%);
+        background: #0f1117;
+    }
+    .main > div:first-child {
+        background: #0f1117;
+    }
+    /* 覆盖 Streamlit 默认亮色容器 */
+    section[data-testid="stSidebar"] > div {
+        background: #161822;
+    }
+    div[data-testid="stVerticalBlock"] {
+        background: transparent;
     }
 
     /* 标题区 */
@@ -73,85 +83,90 @@ def _inject_css():
     .hero-title h1 {
         font-size: 2.4rem;
         font-weight: 700;
-        background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+        background: linear-gradient(135deg, #60a5fa, #a78bfa);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
         margin-bottom: 0.15rem;
     }
     .hero-sub {
         text-align: center;
-        color: #64748b;
+        color: #9ca3af;
         font-size: 0.95rem;
         letter-spacing: 0.05em;
     }
 
-    /* 统计卡片 */
+    /* 统计卡片 — 暗色玻璃质感 */
     .stat-card {
-        background: #fff;
+        background: linear-gradient(145deg, #1a1d2a, #1f2235);
+        border: 1px solid #2a2d3e;
         border-radius: 14px;
         padding: 1.2rem 1rem;
         text-align: center;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-        transition: transform 0.15s;
+        transition: transform 0.15s, border-color 0.2s;
     }
-    .stat-card:hover { transform: translateY(-2px); }
+    .stat-card:hover {
+        transform: translateY(-2px);
+        border-color: #3b3f55;
+    }
     .stat-value {
         font-size: 2rem;
         font-weight: 700;
-        color: #1e293b;
+        color: #e2e8f0;
     }
     .stat-label {
-        font-size: 0.82rem;
-        color: #94a3b8;
+        font-size: 0.78rem;
+        color: #6b7280;
         margin-top: 0.25rem;
-        letter-spacing: 0.04em;
+        letter-spacing: 0.06em;
         text-transform: uppercase;
     }
-    .stat-accent-blue  .stat-value { color: #3b82f6; }
-    .stat-accent-green .stat-value { color: #10b981; }
-    .stat-accent-amber .stat-value { color: #f59e0b; }
-    .stat-accent-red   .stat-value { color: #ef4444; }
+    .stat-accent-blue  .stat-value { color: #60a5fa; }
+    .stat-accent-green .stat-value { color: #34d399; }
+    .stat-accent-amber .stat-value { color: #fbbf24; }
+    .stat-accent-red   .stat-value { color: #f87171; }
 
-    /* 配对卡片 */
+    /* 配对卡片 — 暗色玻璃 */
     .pair-card {
-        background: #fff;
+        background: linear-gradient(145deg, #1a1d2a, #1f2235);
+        border: 1px solid #2a2d3e;
         border-radius: 12px;
         padding: 1rem 1.2rem;
         margin-bottom: 0.6rem;
-        border-left: 4px solid #3b82f6;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        border-left: 4px solid #60a5fa;
+        transition: border-color 0.2s;
     }
+    .pair-card:hover { border-left-color: #818cf8; }
     .pair-card .pair-header {
         font-weight: 600;
-        color: #1e293b;
+        color: #e2e8f0;
         margin-bottom: 0.3rem;
     }
     .pair-card .pair-row {
         display: flex;
         justify-content: space-between;
         font-size: 0.88rem;
-        color: #475569;
+        color: #9ca3af;
         padding: 0.15rem 0;
     }
     .pair-card .tag-trip {
-        background: #dbeafe;
-        color: #1d4ed8;
+        background: rgba(96,165,250,0.15);
+        color: #93c5fd;
         padding: 1px 8px;
         border-radius: 6px;
         font-size: 0.75rem;
         font-weight: 600;
     }
     .pair-card .tag-invoice {
-        background: #dcfce7;
-        color: #15803d;
+        background: rgba(52,211,153,0.15);
+        color: #6ee7b7;
         padding: 1px 8px;
         border-radius: 6px;
         font-size: 0.75rem;
         font-weight: 600;
     }
     .pair-card .tag-miss {
-        background: #fef3c7;
-        color: #b45309;
+        background: rgba(251,191,36,0.15);
+        color: #fcd34d;
         padding: 1px 8px;
         border-radius: 6px;
         font-size: 0.75rem;
@@ -160,19 +175,43 @@ def _inject_css():
     .pair-card .time-text {
         font-family: "SF Mono", "Fira Code", monospace;
         font-size: 0.82rem;
-        color: #64748b;
+        color: #6b7280;
     }
 
     /* 下载按钮容器 */
     .download-box {
-        background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+        background: linear-gradient(135deg, #1e2440, #2d2150);
+        border: 1px solid #3b3f55;
         border-radius: 14px;
         padding: 1.5rem 2rem;
         text-align: center;
-        color: #fff;
+        color: #e2e8f0;
         margin-top: 1rem;
     }
-    .download-box h3 { margin: 0; font-size: 1.15rem; }
+    .download-box h3 { margin: 0; font-size: 1.15rem; color: #c4b5fd; }
+
+    /* Streamlit 原生组件适配 */
+    div[data-testid="stFileUploaderDropzone"] {
+        background: #1a1d2a !important;
+        border: 2px dashed #2a2d3e !important;
+        border-radius: 14px !important;
+        transition: all 0.25s !important;
+    }
+    div[data-testid="stFileUploaderDropzone"]:hover {
+        border-color: #60a5fa !important;
+    }
+    div[data-testid="stFileUploaderDropzone"] p {
+        color: #9ca3af !important;
+    }
+    .stMarkdown, .stCaption, p, span {
+        color: #9ca3af;
+    }
+    h3 { color: #e2e8f0 !important; }
+    div[data-testid="stExpander"] {
+        background: #1a1d2a;
+        border: 1px solid #2a2d3e;
+        border-radius: 10px;
+    }
 
     /* 隐藏多余元素 */
     header[data-testid="stHeader"] { display: none; }
