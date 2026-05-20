@@ -1,428 +1,583 @@
-import streamlit as st
-import PyPDF2
-import pdfplumber
-import io
+"""
+发票合并助手 — Streamlit 应用
+行程单 × 发票 PDF 智能配对，按时间顺序合并
+"""
+import os
 import re
+import math
+import tempfile
+import io
 from datetime import datetime
-from collections import defaultdict
 
-# 页面配置
-st.set_page_config(page_title="发票合并助手", page_icon="📄", layout="wide")
-st.title("📄 发票合并助手")
-st.subheader("智能配对：按金额匹配行程单+发票，按行程单时间升序排列")
+import streamlit as st
+import pdfplumber
+import pikepdf
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
-# 侧边栏说明
-with st.sidebar:
-    st.header("⚙️ 配对规则")
-    st.markdown("""
-    **配对逻辑：**
-    1. 💰 从文件名提取金额作为配对key
-    2. 🎫 行程单 + 🧾 发票 金额相同 → 一组
-    3. 📅 从行程单PDF内容提取上车时间排序
-    4. 📦 最终顺序：`行程单A → 发票A → 行程单B → 发票B → ...`
-    5. ❓ 未配对文件排在最后
-    
-    **文件名示例：**
-    ```
-    【快来车-10.60元-1个行程】高德打车电子发票.pdf
-    【快来车-10.60元-1个行程】高德打车电子行程单.pdf
-    ```
-    """)
-
-# 上传PDF文件
-uploaded_files = st.file_uploader(
-    "📁 上传PDF文件（支持多选）",
-    type=["pdf"],
-    accept_multiple_files=True,
-    help="按住 Ctrl/Cmd 多选，或拖拽上传"
+# ────────────────────────── 页面配置 ──────────────────────────
+st.set_page_config(
+    page_title="发票合并助手",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-# ─────────────────────────────────────────────
-# 工具函数
-# ─────────────────────────────────────────────
-
-def extract_amount_from_filename(filename):
-    """
-    从文件名提取金额作为配对key
-    匹配格式：10.60元 / 11.49元 / 100元 / 10.6元
-    返回标准化字符串，如 '10.60'
-    """
-    pattern = r'(\d+\.?\d*)[元¥]'
-    match = re.search(pattern, filename)
-    if match:
-        amount_str = match.group(1)
-        try:
-            # 标准化为float再转字符串，避免 10.6 和 10.60 不匹配
-            return str(float(amount_str))
-        except ValueError:
-            return amount_str
-    return None
+# ────────────────────────── 中文字体注册 ──────────────────────────
+_FONT_REGISTERED = False
 
 
-def classify_file(filename):
-    """
-    分类文件：行程单 / 发票 / 其他
-    根据高德打车文件名规律判断
-    """
-    name_lower = filename.lower()
-    # 行程单关键词
-    if any(kw in filename for kw in ['行程单', 'itinerary', '行程']):
-        return '行程单'
-    # 发票关键词
-    elif any(kw in filename for kw in ['发票', 'invoice', 'receipt', 'bill']):
-        return '发票'
-    return '其他'
+def _register_cjk_font():
+    global _FONT_REGISTERED
+    if _FONT_REGISTERED:
+        return
+    candidates = [
+        ("C:/Windows/Fonts/msyh.ttc", 0, "SimSun"),
+        ("C:/Windows/Fonts/simsun.ttc", 0, "SimSun"),
+        ("C:/Windows/Fonts/simhei.ttf", 0, "SimHei"),
+        ("/System/Library/Fonts/PingFang.ttc", 0, "PingFang"),
+        ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0, "WQY"),
+        ("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0, "Droid"),
+    ]
+    for path, index, name in candidates:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont(name, path, subfontIndex=index))
+                _FONT_REGISTERED = True
+                return name
+            except Exception:
+                continue
+    return "Helvetica"
 
 
-def extract_date_from_pdf_content(file):
-    """
-    从行程单PDF内容提取上车/出发时间
-    支持多种格式，三层优先级
-    """
-    try:
-        file.seek(0)
-        with pdfplumber.open(file) as pdf:
-            full_text = ""
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
-
-        if not full_text.strip():
-            return None, None  # 返回 (date, datetime)
-
-        # ── 第一优先：关键词 + 日期时间 ──
-        keyword_patterns = [
-            # 上车时间：2024-03-15 08:30
-            r'(?:上车|出发|乘车|行程|起程|登机|发车|开车|上车时间|出发时间|乘车时间|行程时间|打车时间)'
-            r'[时间：:\s]*'
-            r'(\d{4})[-./年](\d{1,2})[-./月](\d{1,2})[日\s]*(\d{1,2}):(\d{2})',
-
-            # 上车时间：2024年03月15日 08:30
-            r'(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{2})',
-
-            # 纯日期+时间：2024-03-15 08:30
-            r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\s+(\d{1,2}):(\d{2})',
-        ]
-
-        for pattern in keyword_patterns:
-            match = re.search(pattern, full_text)
-            if match:
-                groups = match.groups()
-                try:
-                    if len(groups) == 5:
-                        y, mo, d, h, mi = int(groups[0]), int(groups[1]), int(groups[2]), int(groups[3]), int(groups[4])
-                        dt = datetime(y, mo, d, h, mi)
-                        return dt.date(), dt
-                except ValueError:
-                    continue
-
-        # ── 第二优先：只有日期无时间 ──
-        date_patterns = [
-            r'(\d{4})年(\d{1,2})月(\d{1,2})日',
-            r'(\d{4})-(\d{1,2})-(\d{1,2})',
-            r'(\d{4})\.(\d{1,2})\.(\d{1,2})',
-            r'(\d{4})/(\d{1,2})/(\d{1,2})',
-        ]
-
-        for pattern in date_patterns:
-            for match in re.finditer(pattern, full_text):
-                y, mo, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                try:
-                    dt = datetime(y, mo, d)
-                    if datetime(2000, 1, 1) <= dt <= datetime(2099, 12, 31):
-                        return dt.date(), dt
-                except ValueError:
-                    continue
-
-    except Exception as e:
-        pass
-
-    return None, None
+_CJK_FONT = _register_cjk_font()
 
 
-def build_file_info(files):
-    """构建文件信息列表，行程单额外解析PDF内容获取时间"""
-    file_info_list = []
-    progress = st.progress(0, text="正在读取文件信息...")
+# ────────────────────────── 自定义 CSS ──────────────────────────
+def _inject_css():
+    st.markdown(
+        """
+    <style>
+    /* 全局 */
+    .stApp {
+        background: linear-gradient(135deg, #f5f7fa 0%, #e4e8f0 100%);
+    }
 
-    for i, f in enumerate(files):
-        ftype = classify_file(f.name)
-        amount = extract_amount_from_filename(f.name)
-        date = None
-        sort_dt = None
-        date_source = "未识别"
+    /* 标题区 */
+    .hero-title {
+        text-align: center;
+        padding: 1.2rem 0 0.2rem 0;
+    }
+    .hero-title h1 {
+        font-size: 2.4rem;
+        font-weight: 700;
+        background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.15rem;
+    }
+    .hero-sub {
+        text-align: center;
+        color: #64748b;
+        font-size: 0.95rem;
+        letter-spacing: 0.05em;
+    }
 
-        if ftype == '行程单':
-            # 从PDF内容提取时间（用于排序）
-            date, sort_dt = extract_date_from_pdf_content(f)
-            if date:
-                date_source = "PDF内容"
-            else:
-                date_source = "⚠️ 未识别"
-        else:
-            date_source = "文件名（发票无需排序）"
+    /* 统计卡片 */
+    .stat-card {
+        background: #fff;
+        border-radius: 14px;
+        padding: 1.2rem 1rem;
+        text-align: center;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+        transition: transform 0.15s;
+    }
+    .stat-card:hover { transform: translateY(-2px); }
+    .stat-value {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #1e293b;
+    }
+    .stat-label {
+        font-size: 0.82rem;
+        color: #94a3b8;
+        margin-top: 0.25rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+    }
+    .stat-accent-blue  .stat-value { color: #3b82f6; }
+    .stat-accent-green .stat-value { color: #10b981; }
+    .stat-accent-amber .stat-value { color: #f59e0b; }
+    .stat-accent-red   .stat-value { color: #ef4444; }
 
-        file_info_list.append({
-            'file': f,
-            'name': f.name,
-            'date': date,
-            'sort_dt': sort_dt,   # 精确到分钟，用于排序
-            'type': ftype,
-            'amount': amount,
-            'date_source': date_source,
-        })
+    /* 配对卡片 */
+    .pair-card {
+        background: #fff;
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        margin-bottom: 0.6rem;
+        border-left: 4px solid #3b82f6;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .pair-card .pair-header {
+        font-weight: 600;
+        color: #1e293b;
+        margin-bottom: 0.3rem;
+    }
+    .pair-card .pair-row {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.88rem;
+        color: #475569;
+        padding: 0.15rem 0;
+    }
+    .pair-card .tag-trip {
+        background: #dbeafe;
+        color: #1d4ed8;
+        padding: 1px 8px;
+        border-radius: 6px;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .pair-card .tag-invoice {
+        background: #dcfce7;
+        color: #15803d;
+        padding: 1px 8px;
+        border-radius: 6px;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .pair-card .tag-miss {
+        background: #fef3c7;
+        color: #b45309;
+        padding: 1px 8px;
+        border-radius: 6px;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .pair-card .time-text {
+        font-family: "SF Mono", "Fira Code", monospace;
+        font-size: 0.82rem;
+        color: #64748b;
+    }
 
-        progress.progress((i + 1) / len(files), text=f"正在读取：{f.name}")
+    /* 下载按钮容器 */
+    .download-box {
+        background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+        border-radius: 14px;
+        padding: 1.5rem 2rem;
+        text-align: center;
+        color: #fff;
+        margin-top: 1rem;
+    }
+    .download-box h3 { margin: 0; font-size: 1.15rem; }
 
-    progress.empty()
-    return file_info_list
-
-
-def pair_and_sort(file_info_list):
-    """
-    配对逻辑：
-    1. 按金额匹配行程单和发票
-    2. 行程单按PDF内提取的上车时间升序排列
-    3. 每组：行程单在前，发票在后
-    4. 未配对的追加末尾
-    """
-    itineraries = [f for f in file_info_list if f['type'] == '行程单']
-    invoices    = [f for f in file_info_list if f['type'] == '发票']
-    others      = [f for f in file_info_list if f['type'] == '其他']
-
-    # 发票按金额建立索引（同金额可能有多张，用队列）
-    invoice_by_amount = defaultdict(list)
-    for inv in invoices:
-        key = inv['amount']
-        if key:
-            invoice_by_amount[key].append(inv)
-
-    # 行程单按上车时间升序排列（无时间的排最后）
-    itineraries_sorted = sorted(
-        itineraries,
-        key=lambda x: (
-            x['sort_dt'] or datetime.max,
-            x['name']
-        )
+    /* 隐藏多余元素 */
+    header[data-testid="stHeader"] { display: none; }
+    div[data-testid="stDecoration"] { display: none; }
+    footer { visibility: hidden; }
+    </style>
+    """,
+        unsafe_allow_html=True,
     )
 
-    paired_invoice_ids = set()
-    result_groups = []
 
-    for itin in itineraries_sorted:
-        amount_key = itin['amount']
-        paired_inv = None
+# ────────────────────────── 占位页生成 ──────────────────────────
+def _make_placeholder_pdf(message_lines, out_path):
+    """生成占位说明页 PDF（含中文支持）"""
+    c = canvas.Canvas(out_path, pagesize=A4)
+    w, h = A4
+    font_name = _CJK_FONT if _FONT_REGISTERED else "Helvetica"
+    c.setFont(font_name, 16)
+    c.drawString(48, h - 50, "占位说明页")
+    c.setFont(font_name, 11)
+    y = h - 80
+    for line in message_lines:
+        c.drawString(48, y, str(line)[:100])
+        y -= 18
+        if y < 50:
+            c.showPage()
+            c.setFont(font_name, 11)
+            y = h - 50
+    c.showPage()
+    c.save()
 
-        if amount_key and amount_key in invoice_by_amount:
-            for inv in invoice_by_amount[amount_key]:
-                if id(inv['file']) not in paired_invoice_ids:
-                    paired_inv = inv
-                    paired_invoice_ids.add(id(inv['file']))
+
+# ────────────────────────── 页面解析 ──────────────────────────
+def _parse_page(text):
+    """从单页文本识别行程单 / 发票，提取时间和金额"""
+    info = {"type": None, "time": None, "amount": None}
+
+    # ── 行程单 ──
+    if "上车时间" in text and "高德地图" in text:
+        info["type"] = "trip"
+        # 优先：行程时间（带时分）
+        m = re.search(r"行程时间[：:]\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
+        if m:
+            try:
+                info["time"] = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
+                info["time_str"] = m.group(1)
+            except ValueError:
+                pass
+        # 降级：上车时间（仅日期）
+        if info["time"] is None:
+            m = re.search(r"上车时间[：:]\s*(\d{4}-\d{2}-\d{2})", text)
+            if m:
+                try:
+                    info["time"] = datetime.strptime(m.group(1), "%Y-%m-%d")
+                    info["time_str"] = m.group(1)
+                except ValueError:
+                    pass
+        # 降级：上车时间（带时分秒）
+        if info["time"] is None:
+            m = re.search(
+                r"上车时间[：:]\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text
+            )
+            if m:
+                try:
+                    info["time"] = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                    info["time_str"] = m.group(1)
+                except ValueError:
+                    pass
+        # 金额
+        m = re.search(r"合计\s*([0-9]+\.[0-9]{1,2})\s*元", text)
+        if m:
+            info["amount"] = round(float(m.group(1)), 2)
+        return info
+
+    # ── 发票 ──
+    if "电子发票" in text or ("发票号码" in text and "价税合计" in text):
+        info["type"] = "invoice"
+        # 金额
+        m = re.search(r"价税合计.*?[¥￥]\s*([0-9]+\.[0-9]{1,2})", text, re.DOTALL)
+        if m:
+            info["amount"] = round(float(m.group(1)), 2)
+        # 日期 — 多种格式
+        date_parsers = [
+            (
+                r"开票日期[：:]\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+                lambda g: datetime(int(g[0]), int(g[1]), int(g[2])),
+            ),
+            (
+                r"开票日期[：:]\s*(\d{4}-\d{2}-\d{2})",
+                lambda g: datetime.strptime(g[0], "%Y-%m-%d"),
+            ),
+            (
+                r"开票日期[：:]\s*(\d{4}/\d{2}/\d{2})",
+                lambda g: datetime.strptime(g[0], "%Y/%m/%d"),
+            ),
+        ]
+        for pat, fn in date_parsers:
+            m = re.search(pat, text)
+            if m:
+                try:
+                    info["time"] = fn(m.groups())
+                    info["time_str"] = info["time"].strftime("%Y-%m-%d")
+                except (ValueError, IndexError):
+                    pass
+                break
+        return info
+
+    return info
+
+
+# ────────────────────────── 批量提取 ──────────────────────────
+def _extract_all(pdf_paths, progress_placeholder=None):
+    """批量提取 PDF 中所有页面信息"""
+    all_pages = []
+    total = len(pdf_paths)
+    for idx, path in enumerate(pdf_paths):
+        fname = os.path.basename(path)
+        try:
+            with pdfplumber.open(path) as pdf:
+                for i, page in enumerate(pdf.pages):
+                    text = page.extract_text() or ""
+                    info = _parse_page(text)
+                    info["page_num"] = i + 1
+                    info["pdf_file"] = path
+                    info["pdf_name"] = fname
+                    all_pages.append(info)
+        except Exception as e:
+            st.warning(f"读取 {fname} 失败: {e}")
+        if progress_placeholder is not None:
+            progress_placeholder.progress(
+                (idx + 1) / total, f"🔎 解析中… {idx + 1}/{total}"
+            )
+    return all_pages
+
+
+# ────────────────────────── 配对逻辑 ──────────────────────────
+def _match_pairs(pages, amount_tolerance=0.01):
+    """
+    行程单按时间排序，逐个匹配同金额发票。
+    返回 (matched_pairs, unmatched_invoices)
+    matched_pairs: [(trip, invoice|None), ...]
+    """
+    trips = [p for p in pages if p["type"] == "trip"]
+    invoices = [p for p in pages if p["type"] == "invoice"]
+
+    trips.sort(key=lambda x: (x["time"] is None, x["time"] or datetime.max))
+
+    matched = []
+    used_inv = set()
+
+    for trip in trips:
+        trip_amt = trip.get("amount")
+        best_idx = None
+
+        if trip_amt is not None:
+            for i, inv in enumerate(invoices):
+                if i in used_inv:
+                    continue
+                inv_amt = inv.get("amount")
+                if inv_amt is not None and math.isclose(
+                    trip_amt, inv_amt, abs_tol=amount_tolerance
+                ):
+                    best_idx = i
                     break
 
-        result_groups.append({
-            'itinerary': itin,
-            'invoice': paired_inv,
-            'amount': amount_key,
-        })
+        if best_idx is not None:
+            used_inv.add(best_idx)
+            matched.append((trip, invoices[best_idx]))
+        else:
+            matched.append((trip, None))
 
-    # 未配对的发票
-    unpaired_invoices = [
-        inv for inv in invoices
-        if id(inv['file']) not in paired_invoice_ids
+    unmatched = [inv for i, inv in enumerate(invoices) if i not in used_inv]
+    return matched, unmatched
+
+
+# ────────────────────────── PDF 合并 ──────────────────────────
+def _merge_pdfs(matched_pairs, unmatched_invoices, tmpdir):
+    """
+    合并 PDF：每组 [行程单, 发票]，缺失项生成占位页。
+    返回合并后的 PDF 字节数据。
+    """
+    pdf_out = pikepdf.Pdf.new()
+
+    def _append_page(item):
+        try:
+            with pikepdf.open(item["pdf_file"]) as src:
+                pdf_out.pages.append(src.pages[item["page_num"] - 1])
+        except Exception:
+            ph_path = os.path.join(tmpdir, f"ph_{len(pdf_out.pages)}.pdf")
+            _make_placeholder_pdf(
+                ["页面读取失败",
+                 f"文件: {item.get('pdf_name', '?')}",
+                 f"页码: {item.get('page_num', '?')}"],
+                ph_path,
+            )
+            with pikepdf.open(ph_path) as ph:
+                pdf_out.pages.extend(ph.pages)
+
+    for pair_idx, (trip, inv) in enumerate(matched_pairs):
+        _append_page(trip)
+        if inv is not None:
+            _append_page(inv)
+        else:
+            ph_path = os.path.join(tmpdir, f"ph_miss_{pair_idx}.pdf")
+            t_str = trip.get("time_str", "未知时间")
+            amt = trip.get("amount", "?")
+            _make_placeholder_pdf(
+                ["⚠️ 行程单缺少对应发票",
+                 f"时间: {t_str}",
+                 f"金额: {amt} 元"],
+                ph_path,
+            )
+            with pikepdf.open(ph_path) as ph:
+                pdf_out.pages.extend(ph.pages)
+
+    for inv in unmatched_invoices:
+        _append_page(inv)
+
+    out_buf = io.BytesIO()
+    pdf_out.save(out_buf)
+    pdf_out.close()
+    out_buf.seek(0)
+    return out_buf
+
+
+# ────────────────────────── 主界面 ──────────────────────────
+def main():
+    _inject_css()
+
+    # ── 顶部标题 ──
+    st.markdown(
+        '<div class="hero-title"><h1>📄 发票合并助手</h1></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="hero-sub">行程单 × 发票 智能配对 · 按时间顺序合并</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── 说明区 ──
+    with st.expander("📖 使用说明", expanded=False):
+        st.markdown(
+            """
+        **功能说明：**
+        1. 上传包含行程单和发票的 PDF 文件
+        2. 系统自动识别每页是行程单还是发票
+        3. 按金额（误差 ≤ ¥0.01）自动配对：金额相同的行程单和发票编为一组
+        4. 每组按行程时间排序，行程单在前、发票在后
+        5. 点击合并下载，得到一份按时间顺序排列的完整 PDF
+
+        **识别依据：**
+        - 行程单：包含「上车时间」和「高德地图」关键字
+        - 发票：包含「电子发票」或「发票号码 + 价税合计」关键字
+        """
+        )
+
+    # ── 上传区 ──
+    uploaded = st.file_uploader(
+        "📂 拖拽或点击选择 PDF 文件",
+        type="pdf",
+        accept_multiple_files=True,
+        help="支持多个 PDF，每页独立识别",
+        label_visibility="collapsed",
+    )
+
+    if not uploaded:
+        st.markdown(
+            '<div style="text-align:center;color:#94a3b8;margin-top:-0.5rem;">'
+            "支持同时上传行程单和发票的 PDF 文件</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.caption(f"✅ 已选择 {len(uploaded)} 个文件")
+
+    # ── 执行按钮 ──
+    col_l, col_m, col_r = st.columns([1, 1, 1])
+    with col_m:
+        run = st.button(
+            "🔍 分析并合并",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if not run:
+        return
+
+    # ── 处理流程 ──
+    tmpdir = tempfile.mkdtemp()
+    status = st.status("🔄 处理中…", expanded=True)
+
+    # 1. 保存文件
+    status.update(label="📂 正在保存文件…")
+    paths = []
+    with st.spinner("保存上传文件…"):
+        for f in uploaded:
+            p = os.path.join(tmpdir, f.name)
+            with open(p, "wb") as fh:
+                fh.write(f.getbuffer())
+            paths.append(p)
+
+    # 2. 提取内容
+    status.update(label="🔎 正在提取 PDF 内容…")
+    progress_bar = st.progress(0, "准备解析…")
+    all_pages = _extract_all(paths, progress_placeholder=progress_bar)
+
+    trips = [p for p in all_pages if p["type"] == "trip"]
+    invoices = [p for p in all_pages if p["type"] == "invoice"]
+    unknown = [p for p in all_pages if p["type"] is None]
+
+    # 3. 配对
+    status.update(label="🔗 正在配对行程单与发票…")
+    matched, unmatched_inv = _match_pairs(all_pages)
+    matched_cnt = sum(1 for _, inv in matched if inv is not None)
+    unmatched_trip_cnt = sum(1 for _, inv in matched if inv is None)
+
+    # 4. 合并
+    status.update(label="📄 正在合并 PDF…")
+    merged_buf = _merge_pdfs(matched, unmatched_inv, tmpdir)
+    status.update(label="✅ 处理完成！", state="complete")
+
+    # ── 统计卡片 ──
+    st.markdown("### 📊 分析概览")
+    cols = st.columns(6)
+    stats = [
+        ("行程单", len(trips), "blue"),
+        ("发票", len(invoices), "green"),
+        ("✅ 已配对", matched_cnt, "blue"),
+        ("⚠️ 缺发票", unmatched_trip_cnt, "amber"),
+        ("📄 未匹配发票", len(unmatched_inv), "amber"),
+        ("❓ 无法识别", len(unknown), "red"),
     ]
-
-    # 其他文件
-    others_sorted = sorted(others, key=lambda x: x['name'])
-
-    # 构建最终文件列表
-    ordered_files = []
-    for group in result_groups:
-        ordered_files.append(group['itinerary']['file'])
-        if group['invoice']:
-            ordered_files.append(group['invoice']['file'])
-
-    for inv in unpaired_invoices:
-        ordered_files.append(inv['file'])
-
-    for o in others_sorted:
-        ordered_files.append(o['file'])
-
-    return ordered_files, result_groups, unpaired_invoices, others_sorted
-
-
-def merge_pdfs(pdf_files):
-    """合并PDF文件列表"""
-    if not pdf_files:
-        return None
-    merger = PyPDF2.PdfMerger()
-    for pdf in pdf_files:
-        pdf.seek(0)
-        merger.append(pdf)
-    output = io.BytesIO()
-    merger.write(output)
-    output.seek(0)
-    merger.close()
-    return output
-
-
-# ─────────────────────────────────────────────
-# 主逻辑
-# ─────────────────────────────────────────────
-
-if uploaded_files:
-    st.success(f"✅ 已上传 {len(uploaded_files)} 个文件")
-
-    # 构建文件信息
-    file_info_list = build_file_info(uploaded_files)
-
-    # ── 文件识别概览 ──
-    with st.expander("📋 文件识别结果", expanded=True):
-        header_cols = st.columns([1, 5, 2, 2, 2])
-        header_cols[0].markdown("**序号**")
-        header_cols[1].markdown("**文件名**")
-        header_cols[2].markdown("**类型**")
-        header_cols[3].markdown("**金额(配对key)**")
-        header_cols[4].markdown("**识别日期**")
-        st.markdown("---")
-
-        for i, info in enumerate(file_info_list):
-            cols = st.columns([1, 5, 2, 2, 2])
-            icon = "🎫" if info['type'] == '行程单' else "🧾" if info['type'] == '发票' else "📄"
-            cols[0].write(i + 1)
-            cols[1].write(info['name'])
-            cols[2].write(f"{icon} {info['type']}")
-            cols[3].write(f"💰 {info['amount'] or '⚠️ 未识别'}")
-            cols[4].write(
-                str(info['sort_dt'].strftime('%Y-%m-%d %H:%M') if info['sort_dt'] else
-                    str(info['date']) if info['date'] else '⚠️ 未识别')
+    for col, (label, val, accent) in zip(cols, stats):
+        with col:
+            st.markdown(
+                f'<div class="stat-card stat-accent-{accent}">'
+                f'<div class="stat-value">{val}</div>'
+                f'<div class="stat-label">{label}</div>'
+                f"</div>",
+                unsafe_allow_html=True,
             )
 
-    # ── 合并按钮 ──
-    if st.button("🔗 开始智能配对并合并", type="primary", use_container_width=True):
-        try:
-            with st.spinner("🔄 正在按金额配对并排序..."):
-                ordered_files, group_preview, unpaired_invoices, other_files = pair_and_sort(file_info_list)
+    # ── 配对明细 ──
+    st.markdown("### 🔗 配对明细")
+    st.caption(f"共 {len(matched)} 组，按行程时间排序")
 
-            # ── 配对结果预览 ──
-            with st.expander("✅ 配对分组预览（最终合并顺序）", expanded=True):
+    for idx, (trip, inv) in enumerate(matched):
+        t_str = trip.get("time_str", "无时间")
+        t_amt = trip.get("amount", "?")
+        t_file = trip.get("pdf_name", "?")
+        t_page = trip.get("page_num", "?")
 
-                if group_preview:
-                    st.markdown("### 🗂️ 配对分组（按行程单时间升序）")
-                    for i, group in enumerate(group_preview):
-                        itin   = group['itinerary']
-                        inv    = group['invoice']
-                        amount = group['amount']
-                        paired = inv is not None
+        if inv is not None:
+            i_str = inv.get("time_str", "无时间")
+            i_amt = inv.get("amount", "?")
+            i_file = inv.get("pdf_name", "?")
+            i_page = inv.get("page_num", "?")
+            st.markdown(
+                f'<div class="pair-card">'
+                f'<div class="pair-header">第 {idx + 1} 组 · 金额 ¥{t_amt}</div>'
+                f'<div class="pair-row"><span><span class="tag-trip">行程单</span> {t_file} (p.{t_page})</span>'
+                f'<span class="time-text">{t_str}</span></div>'
+                f'<div class="pair-row"><span><span class="tag-invoice">发　票</span> {i_file} (p.{i_page})</span>'
+                f'<span class="time-text">{i_str}</span></div>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="pair-card" style="border-left-color:#f59e0b;">'
+                f'<div class="pair-header">第 {idx + 1} 组 · 金额 ¥{t_amt}</div>'
+                f'<div class="pair-row"><span><span class="tag-trip">行程单</span> {t_file} (p.{t_page})</span>'
+                f'<span class="time-text">{t_str}</span></div>'
+                f'<div class="pair-row"><span><span class="tag-miss">⚠️ 缺少发票</span></span>'
+                f'<span class="time-text">—</span></div>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-                        # 时间显示
-                        time_str = (
-                            itin['sort_dt'].strftime('%Y-%m-%d %H:%M')
-                            if itin['sort_dt'] else
-                            str(itin['date']) if itin['date'] else '未知时间'
-                        )
+    # ── 下载区 ──
+    st.markdown(
+        '<div class="download-box">'
+        "<h3>✅ 合并完成，点击下载</h3>"
+        '<p style="margin:0.3rem 0 0.5rem;font-size:0.85rem;opacity:0.9;">'
+        "文件已按时间顺序排列，缺失项已自动插入占位说明页</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.download_button(
+        label="📥 下载合并 PDF",
+        data=merged_buf,
+        file_name="合并报销文件.pdf",
+        mime="application/pdf",
+        type="primary",
+        use_container_width=True,
+    )
 
-                        st.markdown(
-                            f"**第 {i+1} 组 · ⏰ {time_str} · 💰 {amount or '未知金额'}元**"
-                        )
+    # 清理临时文件
+    try:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
 
-                        # 行程单行
-                        c1, c2, c3 = st.columns([1, 6, 2])
-                        c1.write("🎫")
-                        c2.write(itin['name'])
-                        c3.write("`行程单`")
 
-                        # 发票行
-                        c1, c2, c3 = st.columns([1, 6, 2])
-                        if paired:
-                            c1.write("🧾")
-                            c2.write(inv['name'])
-                            c3.write("`发票`")
-                        else:
-                            c1.write("⚠️")
-                            c2.write("*无对应发票*")
-                            c3.write("`未配对`")
-
-                        st.markdown("---")
-
-                if unpaired_invoices:
-                    st.markdown("### 🧾 未配对发票（追加到末尾）")
-                    for inv in unpaired_invoices:
-                        c1, c2 = st.columns([1, 7])
-                        c1.write("🧾")
-                        c2.write(f"{inv['name']}  ·  💰 {inv['amount'] or '未知金额'}元")
-
-                if other_files:
-                    st.markdown("### 📄 其他文件（追加到末尾）")
-                    for o in other_files:
-                        c1, c2 = st.columns([1, 7])
-                        c1.write("📄")
-                        c2.write(o['name'])
-
-                # 完整顺序
-                st.markdown("### 📑 最终合并顺序")
-                for idx, f in enumerate(ordered_files):
-                    info = next((x for x in file_info_list if x['file'] == f), None)
-                    ftype = info['type'] if info else '其他'
-                    icon  = "🎫" if ftype == '行程单' else "🧾" if ftype == '发票' else "📄"
-                    time_str = (
-                        info['sort_dt'].strftime('%Y-%m-%d %H:%M')
-                        if info and info['sort_dt'] else
-                        str(info['date']) if info and info['date'] else '未知时间'
-                    )
-                    st.text(f"  {idx+1:>2}. {icon} [{ftype}]  {f.name}  ({time_str})")
-
-            # ── 合并 PDF ──
-            with st.spinner("📦 正在合并 PDF..."):
-                merged_pdf = merge_pdfs(ordered_files)
-
-            if merged_pdf:
-                filename_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                st.download_button(
-                    label="📥 下载合并后的发票包",
-                    data=merged_pdf,
-                    file_name=f"发票合并包_{filename_ts}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True
-                )
-                st.balloons()
-
-                paired_count   = sum(1 for g in group_preview if g['invoice'] is not None)
-                unpaired_itin  = sum(1 for g in group_preview if g['invoice'] is None)
-                unpaired_inv   = len(unpaired_invoices)
-                st.success(
-                    f"✨ 合并成功！共 {len(group_preview)} 张行程单，"
-                    f"成功配对 {paired_count} 组，"
-                    f"行程单未配对 {unpaired_itin} 张，"
-                    f"发票未配对 {unpaired_inv} 张"
-                )
-
-        except Exception as e:
-            st.error(f"❌ 处理失败：{str(e)}")
-            st.exception(e)
-
-else:
-    st.info("👆 请上传 PDF 格式的文件开始使用")
-    st.markdown("""
-    ### 📌 使用说明
-
-    | 步骤 | 操作 |
-    |------|------|
-    | 1️⃣ | 上传所有行程单和发票 PDF |
-    | 2️⃣ | 系统自动按金额配对，从行程单PDF提取上车时间 |
-    | 3️⃣ | 点击「开始智能配对并合并」|
-    | 4️⃣ | 预览配对分组结果 |
-    | 5️⃣ | 下载合并后的 PDF |
-
-    ### 💡 文件命名规则
-    ```
-    【快来车-10.60元-1个行程】高德打车电子发票.pdf   ← 发票
-    【快来车-10.60元-1个行程】高德打车电子行程单.pdf  ← 行程单
-    （金额相同 → 自动配对为一组）
-    ```
-    """)
-
-# 页脚
-st.markdown("---")
-st.caption("✅ 金额匹配配对 | 行程单时间排序 | 行程单在前发票在后 | pdfplumber解析")
+if __name__ == "__main__":
+    main()
