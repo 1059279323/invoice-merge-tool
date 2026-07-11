@@ -28,14 +28,13 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ────────────────────────── 中文字体注册 ──────────────────────────
-_FONT_REGISTERED = False
+# ──────────── 中文字体注册（延迟 + 缓存） ────────────
+@st.cache_resource
+def _get_cjk_font():
+    """Lazily register and return a CJK font for ReportLab. Cached across sessions."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
 
-
-def _register_cjk_font():
-    global _FONT_REGISTERED
-    if _FONT_REGISTERED:
-        return
     candidates = [
         ("C:/Windows/Fonts/msyh.ttc", 0, "SimSun"),
         ("C:/Windows/Fonts/simsun.ttc", 0, "SimSun"),
@@ -48,17 +47,13 @@ def _register_cjk_font():
         if os.path.exists(path):
             try:
                 pdfmetrics.registerFont(TTFont(name, path, subfontIndex=index))
-                _FONT_REGISTERED = True
                 return name
             except Exception:
                 continue
     return "Helvetica"
 
 
-_CJK_FONT = _register_cjk_font()
-
-
-# ────────────────────────── 自定义 CSS ──────────────────────────
+# ────────────────────────── 自定义 CSS ────────────────────────── ──────────────────────────
 def _inject_css():
     st.markdown(
         """
@@ -229,9 +224,11 @@ def _inject_css():
 # ────────────────────────── 占位页生成 ──────────────────────────
 def _make_placeholder_pdf(message_lines, out_path):
     """生成占位说明页 PDF（含中文支持）"""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
     c = canvas.Canvas(out_path, pagesize=A4)
     w, h = A4
-    font_name = _CJK_FONT if _FONT_REGISTERED else "Helvetica"
+    font_name = _get_cjk_font()
     c.setFont(font_name, 16)
     c.drawString(48, h - 50, "占位说明页")
     c.setFont(font_name, 11)
@@ -328,6 +325,7 @@ def _parse_page(text):
 # ────────────────────────── 批量提取 ──────────────────────────
 def _extract_all(pdf_paths, progress_placeholder=None):
     """批量提取 PDF 中所有页面信息"""
+    import pdfplumber
     all_pages = []
     total = len(pdf_paths)
     for idx, path in enumerate(pdf_paths):
@@ -396,6 +394,7 @@ def _merge_pdfs(matched_pairs, unmatched_invoices, tmpdir):
     合并 PDF：每组 [行程单, 发票]，缺失项生成占位页。
     返回合并后的 PDF 字节数据。
     """
+    import pikepdf
     pdf_out = pikepdf.Pdf.new()
 
     def _append_page(item):
@@ -448,6 +447,9 @@ def _images_to_pdf(image_files, page_size="A4", fit_mode="fit"):
     fit_mode: "fit" 等比缩放适应 | "fill" 拉伸铺满
     返回 PDF 字节数据。
     """
+    from PIL import Image
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
     if not image_files:
         return None
 
@@ -514,6 +516,7 @@ def _insert_pdf_pages(base_pdf_buf, insert_pdf_buf, position, page_range=None):
     page_range: None 全部页面，或 (start, end) 1-based 闭区间
     返回合并后的 PDF 字节数据。
     """
+    import pikepdf
     base = pikepdf.open(base_pdf_buf)
     insert = pikepdf.open(insert_pdf_buf)
 
@@ -819,6 +822,7 @@ def _pdf_insert_tab():
     insert_buf_io = BytesIO(insert_file.getbuffer())
 
     try:
+        import pikepdf
         with pikepdf.open(base_buf_io) as b:
             base_pages = len(b.pages)
         with pikepdf.open(insert_buf_io) as ins:
