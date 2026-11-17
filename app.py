@@ -1,8 +1,30 @@
+"""
+发票合并助手 — Streamlit 单文件应用
+
+行程单 / 发票 / 明细附件 自动配对，按行程时间顺序合并为一份 PDF
+
+依赖（只需这三个，全部是纯 wheel，无需额外系统组件）：
+    pip install streamlit pymupdf pillow
+
+识别逻辑（v2）
+-------------
+1. 文本归一化：NFKC 把「⾏程单 / 上⻋时间 / ⾦额」这类兼容字形还原成正常汉字，
+   全角数字全角括号转半角，去掉汉字之间的排版空格（"单  价" → "单价"）。
+2. 打分分类：不再用「必须同时出现 A 和 B」的硬条件，而是给关键词加权打分，
+   行程单 / 发票 / 明细附件 三选一，分数不够才判未识别。
+3. 金额抽取：发票优先取「(小写)」紧跟的数字（兼容 ¥ 在前或在后），
+   取不到就用大写金额（壹拾壹圆肆角玖分）反算，最后才用「价税合计」附近或全页最大值。
+4. 时间抽取：行程单优先「行程时间 / 行程起止日期 / 上车时间」，
+   「申请日期」只作最后兜底（它是开票日，不是行程日）。
+5. 配对：金额一致（可调容差）→ 同额多张时取开票日与行程日最接近的一张。
+"""
 from __future__ import annotations
 
+import atexit
 import hashlib
 import os
 import re
+import shutil
 import tempfile
 import unicodedata
 from datetime import datetime
@@ -840,6 +862,72 @@ def _apply_frame(pages, df):
     return out
 
 
+def _rebuild(state, groups):
+    """按给定分组顺序重建 PDF，并写回会话状态"""
+    pdf = build_merged_pdf(groups, state["unmatched_inv"], state["unmatched_sup"],
+                           cover=state.get("cover", False), title=state.get("title", ""))
+    st.session_state["t1"] = {
+        **state,
+        "groups": groups,
+        "pdf": pdf,
+        "page_count": _page_count(pdf),
+    }
+
+
+def _render_order_panel(state):
+    """手动上下移动每一组，改完立即按新顺序重新生成 PDF"""
+    groups = state["groups"]
+    if len(groups) < 2:
+        return
+
+    with st.expander("📑 调整导出顺序（自动排序不满意时用）", expanded=False):
+        st.caption(
+            "用 ↑ ↓ 调整每一组在合并 PDF 里的先后位置，改完立即按新顺序重新生成，"
+            "上面的下载按钮拿到的就是当前顺序。"
+        )
+        for i, g in enumerate(groups):
+            trip, inv = g["trip"], g["invoice"]
+            amt = trip.get("amount")
+            if g.get("self"):
+                status = "车票/机票"
+            elif inv is not None:
+                status = "已配对"
+            else:
+                status = "缺发票"
+            pages_n = 1 + (0 if g.get("self") else (1 if inv else 0)) + len(g["supports"])
+            amt_txt = f"¥{amt:,.2f}" if amt is not None else "金额未识别"
+            desc = (f"**第 {i + 1} 组**　{amt_txt}　·　{status}　·　{pages_n} 页"
+                    f"　·　{trip.get('time_str') or '无时间'}")
+
+            c_txt, c_up, c_dn = st.columns([9.2, 0.5, 0.5], vertical_alignment="center")
+            with c_txt:
+                st.markdown(desc)
+            with c_up:
+                if st.button("↑", key=f"ord_up_{i}", width="content",
+                             disabled=(i == 0), help="整组上移一位"):
+                    order = list(groups)
+                    order[i - 1], order[i] = order[i], order[i - 1]
+                    _rebuild(state, order)
+                    st.rerun()
+            with c_dn:
+                if st.button("↓", key=f"ord_dn_{i}", width="content",
+                             disabled=(i == len(groups) - 1), help="整组下移一位"):
+                    order = list(groups)
+                    order[i + 1], order[i] = order[i], order[i + 1]
+                    _rebuild(state, order)
+                    st.rerun()
+
+        st.divider()
+        c_reset, c_tip = st.columns([1, 3], vertical_alignment="center")
+        with c_reset:
+            if st.button("↩️ 恢复自动顺序", key="ord_reset", width="stretch",
+                         help="按行程时间重新排序（配对关系不变）"):
+                _rebuild(state, sorted(groups, key=lambda g: _sort_key(g["trip"])))
+                st.rerun()
+        with c_tip:
+            st.caption("「恢复自动顺序」只重排先后，不会改动已经配好的行程单与发票。")
+
+
 def _render_result(state):
     pages = state["pages"]
     groups = state["groups"]
@@ -898,7 +986,8 @@ def _render_result(state):
 
     # ── 配对明细 ──
     st.markdown("#### 🔗 配对明细")
-    st.caption(f"每组顺序：行程单/车票 → 发票 → 明细附件。共 {len(groups)} 组。")
+    st.caption(f"每组顺序：行程单/车票 → 发票 → 明细附件。共 {len(groups)} 组。"
+               "顺序或配对不满意，用下面的「调整导出顺序」手动挪动。")
 
     for idx, g in enumerate(groups):
         trip, inv = g["trip"], g["invoice"]
@@ -938,6 +1027,8 @@ def _render_result(state):
             + "".join(lines) + "</div>",
             unsafe_allow_html=True,
         )
+
+    _render_order_panel(state)
 
     if unmatched_inv or unmatched_sup:
         with st.expander(
@@ -1086,6 +1177,9 @@ def _invoice_merge_tab():
     with c_clear:
         if st.button("🗑️ 清空全部", key="tab1_clear", width="stretch",
                      help="一次删掉已选的全部文件，重新开始"):
+            old_dir = (st.session_state.get("t1") or {}).get("tmpdir")
+            if old_dir:
+                shutil.rmtree(old_dir, ignore_errors=True)
             st.session_state.pop("t1", None)
             _reset_uploaders("tab1_uploader")
             st.rerun()
@@ -1104,7 +1198,16 @@ def _invoice_merge_tab():
     sig = _signature(uploaded, tolerance)
 
     if run:
+        # 旧一轮的临时文件先清掉，避免 %TEMP% 里堆文件
+        old_dir = (st.session_state.get("t1") or {}).get("tmpdir")
+        if old_dir:
+            shutil.rmtree(old_dir, ignore_errors=True)
+
+        # 注意：这个目录必须活到会话结束。后面的「手动修正」「调整顺序」都要重新读取源 PDF，
+        # 早期版本在这里 finally 就删了，导致重新生成的 PDF 全是「页面读取失败」。
         tmpdir = tempfile.mkdtemp(prefix="invoice_")
+        atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
+        keep = False
         try:
             progress = st.progress(0.0, "准备解析…")
             saved = _save_uploads(uploaded, tmpdir)
@@ -1128,10 +1231,12 @@ def _invoice_merge_tab():
                 "unmatched_inv": unmatched_inv, "unmatched_sup": unmatched_sup,
                 "pdf": pdf_bytes, "page_count": _page_count(pdf_bytes),
                 "tolerance": tolerance, "cover": cover, "title": title,
+                "tmpdir": tmpdir,
             }
+            keep = True
         finally:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            if not keep:
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
     state = st.session_state.get("t1")
     if not state or state.get("sig") != sig:
@@ -1205,7 +1310,6 @@ def _img_to_pdf_tab():
             else:
                 st.error("转换失败，请检查图片格式")
         finally:
-            import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
