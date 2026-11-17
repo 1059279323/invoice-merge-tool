@@ -773,6 +773,16 @@ def _file_line(tag, tag_cls, name, page, extra=""):
 
 
 # ═══════════════════════════════ Tab 1：发票合并 ═══════════════════════════════
+def _up_key(name):
+    """上传控件的 key 带版本号；版本号 +1 就等于清空该控件（Streamlit 无内置重置）"""
+    return f"{name}_v{st.session_state.get(name + '_ver', 0)}"
+
+
+def _reset_uploaders(*names):
+    for n in names:
+        st.session_state[n + "_ver"] = st.session_state.get(n + "_ver", 0) + 1
+
+
 def _save_uploads(files, tmpdir):
     """保存上传文件，避免同名覆盖；返回 [(磁盘路径, 原始文件名)]"""
     saved = []
@@ -863,7 +873,7 @@ def _render_result(state):
                 file_name="合并报销文件.pdf",
                 mime="application/pdf",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key="tab1_dl",
             )
 
@@ -958,7 +968,7 @@ def _render_result(state):
         df = _pages_to_frame(pages)
         st.dataframe(
             df[["文件", "页", "类型", "时间", "金额", "命中", "摘要"]],
-            use_container_width=True, hide_index=True, height=320,
+            width="stretch", hide_index=True, height=320,
         )
         dump = []
         for i, p in enumerate(pages):
@@ -987,7 +997,7 @@ def _render_result(state):
         df = _pages_to_frame(pages)
         edited = st.data_editor(
             df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=320,
             disabled=["序号", "文件", "页", "命中", "摘要"],
@@ -1001,7 +1011,7 @@ def _render_result(state):
             },
             key="tab1_editor",
         )
-        if st.button("✅ 应用修正并重新生成", key="tab1_apply", use_container_width=True):
+        if st.button("✅ 应用修正并重新生成", key="tab1_apply", width="stretch"):
             new_pages = _apply_frame(pages, edited)
             new_groups, new_inv, new_sup = match_pages(new_pages, state["tolerance"])
             new_pdf = build_merged_pdf(new_groups, new_inv, new_sup,
@@ -1054,23 +1064,31 @@ def _invoice_merge_tab():
         type="pdf",
         accept_multiple_files=True,
         help="支持多个 PDF，每页独立识别",
-        key="tab1_uploader",
+        key=_up_key("tab1_uploader"),
     )
     if not uploaded:
         st.info("👆 请上传行程单和发票的 PDF 文件")
         return
 
     total_mb = sum(len(f.getvalue()) for f in uploaded) / 1048576
-    with st.expander(f"✅ 已选择 {len(uploaded)} 个文件 · {total_mb:.1f} MB（点开可核对）",
-                     expanded=False):
-        rows = "".join(
-            f'<div class="line"><span class="tag sup">PDF</span>'
-            f'<span class="fname" title="{escape(f.name)}">{escape(f.name)}</span>'
-            f'<span class="pg"></span>'
-            f'<span class="tm">{len(f.getvalue()) / 1024:.0f} KB</span></div>'
-            for f in uploaded
-        )
-        st.markdown(rows, unsafe_allow_html=True)
+    c_list, c_clear = st.columns([5, 1], vertical_alignment="top")
+    with c_list:
+        with st.expander(f"✅ 已选择 {len(uploaded)} 个文件 · {total_mb:.1f} MB（点开可核对）",
+                         expanded=False):
+            rows = "".join(
+                f'<div class="line"><span class="tag sup">PDF</span>'
+                f'<span class="fname" title="{escape(f.name)}">{escape(f.name)}</span>'
+                f'<span class="pg"></span>'
+                f'<span class="tm">{len(f.getvalue()) / 1024:.0f} KB</span></div>'
+                for f in uploaded
+            )
+            st.markdown(rows, unsafe_allow_html=True)
+    with c_clear:
+        if st.button("🗑️ 清空全部", key="tab1_clear", width="stretch",
+                     help="一次删掉已选的全部文件，重新开始"):
+            st.session_state.pop("t1", None)
+            _reset_uploaders("tab1_uploader")
+            st.rerun()
 
     c1, c2, c3 = st.columns([1, 1, 1.4])
     with c1:
@@ -1081,7 +1099,7 @@ def _invoice_merge_tab():
     with c3:
         title = st.text_input("封面标题", value="报销材料汇总", key="tab1_title", disabled=not cover)
 
-    run = st.button("🔍 分析并合并", type="primary", use_container_width=True, key="tab1_run")
+    run = st.button("🔍 分析并合并", type="primary", width="stretch", key="tab1_run")
 
     sig = _signature(uploaded, tolerance)
 
@@ -1133,13 +1151,21 @@ def _img_to_pdf_tab():
         type=["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"],
         accept_multiple_files=True,
         help="支持 JPG / PNG / BMP / WebP / TIFF",
-        key="tab2_uploader",
+        key=_up_key("tab2_uploader"),
     )
     if not img_files:
         st.info("👆 请上传图片文件")
         return
 
-    st.caption(f"✅ 已选择 {len(img_files)} 张图片")
+    c_info, c_clear = st.columns([5, 1], vertical_alignment="top")
+    with c_info:
+        total_mb = sum(len(f.getvalue()) for f in img_files) / 1048576
+        st.caption(f"✅ 已选择 {len(img_files)} 张图片 · {total_mb:.1f} MB")
+    with c_clear:
+        if st.button("🗑️ 清空全部", key="tab2_clear", width="stretch",
+                     help="一次删掉已选的全部图片"):
+            _reset_uploaders("tab2_uploader")
+            st.rerun()
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1155,7 +1181,7 @@ def _img_to_pdf_tab():
             key="tab2_fit", disabled=(page_size == "original"),
         )
 
-    if st.button("🖼️ 转换为 PDF", type="primary", use_container_width=True, key="tab2_conv"):
+    if st.button("🖼️ 转换为 PDF", type="primary", width="stretch", key="tab2_conv"):
         tmpdir = tempfile.mkdtemp(prefix="img2pdf_")
         try:
             paths = []
@@ -1174,7 +1200,7 @@ def _img_to_pdf_tab():
                 st.download_button(
                     "📥 下载 PDF", data=data, file_name="图片转PDF.pdf",
                     mime="application/pdf", type="primary",
-                    use_container_width=True, key="tab2_dl",
+                    width="stretch", key="tab2_dl",
                 )
             else:
                 st.error("转换失败，请检查图片格式")
@@ -1190,10 +1216,22 @@ def _pdf_insert_tab():
     c1, c2 = st.columns(2)
     with c1:
         base_file = st.file_uploader("📄 主 PDF 文件", type="pdf",
-                                     accept_multiple_files=False, key="tab3_base")
+                                     accept_multiple_files=False, key=_up_key("tab3_base"))
     with c2:
         insert_file = st.file_uploader("📑 要插入的 PDF 文件", type="pdf",
-                                       accept_multiple_files=False, key="tab3_insert")
+                                       accept_multiple_files=False, key=_up_key("tab3_insert"))
+
+    if base_file or insert_file:
+        c_info, c_clear = st.columns([5, 1], vertical_alignment="top")
+        with c_info:
+            st.caption("已选：" + " · ".join(
+                x for x in [f"主文件 {base_file.name}" if base_file else "",
+                            f"插入 {insert_file.name}" if insert_file else ""] if x))
+        with c_clear:
+            if st.button("🗑️ 清空全部", key="tab3_clear", width="stretch",
+                         help="把两个上传框一起清空"):
+                _reset_uploaders("tab3_base", "tab3_insert")
+                st.rerun()
 
     if not base_file or not insert_file:
         st.info("👆 请分别上传主 PDF 和要插入的 PDF")
@@ -1228,7 +1266,7 @@ def _pdf_insert_tab():
     insert_all = st.checkbox("插入全部页面", value=True, key="tab3_all")
     page_range = None if insert_all else (int(insert_start), int(insert_end))
 
-    if st.button("📑 执行插入", type="primary", use_container_width=True, key="tab3_run"):
+    if st.button("📑 执行插入", type="primary", width="stretch", key="tab3_run"):
         with st.spinner("🔄 正在合并…"):
             try:
                 out = insert_pdf_pages(
@@ -1240,7 +1278,7 @@ def _pdf_insert_tab():
                 st.download_button(
                     "📥 下载合并 PDF", data=out, file_name="插入后PDF.pdf",
                     mime="application/pdf", type="primary",
-                    use_container_width=True, key="tab3_dl",
+                    width="stretch", key="tab3_dl",
                 )
             except Exception as exc:
                 st.error(f"插入失败：{exc}")
